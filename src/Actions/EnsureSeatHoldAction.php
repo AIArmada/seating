@@ -2,10 +2,8 @@
 
 declare(strict_types=1);
 
-namespace AIArmada\Seating\Services;
+namespace AIArmada\Seating\Actions;
 
-use AIArmada\Seating\Contracts\SeatAllocatorInterface;
-use AIArmada\Seating\Data\AllocationResult;
 use AIArmada\Seating\Enums\SeatingMode;
 use AIArmada\Seating\Exceptions\InsufficientSeatsException;
 use AIArmada\Seating\Models\Seat;
@@ -15,37 +13,36 @@ use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 
-final class DefaultSeatAllocator implements SeatAllocatorInterface
+class EnsureSeatHoldAction
 {
-    public function allocate(
+    /**
+     * @param  array<int, string>  $categoryPreferences
+     * @return Collection<int, SeatHold>
+     */
+    public function handle(
         SeatMap $map,
         int $quantity,
-        SeatingMode $mode = SeatingMode::Assigned,
+        SeatingMode $mode,
         ?string $heldByType = null,
         ?string $heldById = null,
         ?string $reference = null,
         array $categoryPreferences = [],
     ): Collection {
-        if ($quantity <= 0) {
+        if ($quantity <= 0 || ! $mode->requiresAllocation()) {
             return new Collection;
         }
 
-        if ($mode === SeatingMode::GeneralAdmission) {
-            return new Collection;
-        }
-
-        return DB::transaction(function () use ($map, $quantity, $heldByType, $heldById, $reference, $categoryPreferences): Collection {
+        return DB::transaction(function () use ($map, $quantity, $heldByType, $heldById, $reference, $categoryPreferences, $mode): Collection {
             $ttlMinutes = (int) config('seating.holds.ttl_minutes', 15);
             $expiresAt = now()->addMinutes($ttlMinutes);
-
-            $allocated = new Collection;
+            $holds = new Collection;
 
             for ($i = 0; $i < $quantity; $i++) {
-                $seat = $this->pickSeat($map, $categoryPreferences, $allocated);
+                $seat = $this->pickSeat($map, $categoryPreferences, $holds, $mode);
 
                 if ($seat === null) {
                     throw new InsufficientSeatsException(
-                        "Could not allocate {$quantity} seats; only " . $allocated->count() . ' available.'
+                        "Could not hold {$quantity} seats; only " . $holds->count() . ' available.'
                     );
                 }
 
@@ -57,21 +54,18 @@ final class DefaultSeatAllocator implements SeatAllocatorInterface
                     'expires_at' => $expiresAt,
                 ]);
 
-                $allocated->push(new AllocationResult(
-                    seatId: $seat->id,
-                    sectionCode: $seat->section?->code ?? '',
-                    rowLabel: $seat->row_label,
-                    seatLabel: $seat->seat_label,
-                    category: $seat->category,
-                    holdId: $hold->id,
-                ));
+                $holds->push($hold);
             }
 
-            return $allocated;
+            return $holds;
         });
     }
 
-    private function pickSeat(SeatMap $map, array $preferences, Collection $already): ?Seat
+    /**
+     * @param  array<int, string>  $preferences
+     * @param  Collection<int, SeatHold>  $already
+     */
+    private function pickSeat(SeatMap $map, array $preferences, Collection $already, SeatingMode $mode): ?Seat
     {
         $query = $this->availableSeatsQuery($map, $already);
 
@@ -89,13 +83,16 @@ final class DefaultSeatAllocator implements SeatAllocatorInterface
         return $query->first();
     }
 
-    /** @return Builder<Seat> */
+    /**
+     * @param  Collection<int, SeatHold>  $already
+     * @return Builder<Seat>
+     */
     private function availableSeatsQuery(SeatMap $map, Collection $already): Builder
     {
         return Seat::query()
             ->whereHas('section', fn (Builder $query): Builder => $query->where('seat_map_id', $map->id))
             ->where('status', 'available')
-            ->whereNotIn('id', $already->pluck('seatId')->all())
+            ->whereNotIn('id', $already->pluck('seat_id')->all())
             ->whereDoesntHave('holds', fn (Builder $query): Builder => $query->where('expires_at', '>', now()))
             ->orderBy('seat_section_id')
             ->orderBy('row_number')
